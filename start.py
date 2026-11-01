@@ -62,17 +62,20 @@ _AGENT_USAGE = """\
 记录里 cmdPid 是这一项当前 cmd 的进程号，cmdTitle 是窗口标题。state 为 running 时才能读取输出。
 error 有内容时，表示 cmd 还没弹出就失败了，例如找不到 JDK。这份记录不是启动日志。
 
-选择启动项时，只根据本次改动文件的路径：
-- 文件要落在该项的工作目录里。同时落在上下两级目录时，取最深的那一项。
-- 恰好命中一项，并且该项 allowAgent 为 true，才可以操作。
-- 同一个目录有多项时，只勾选其中一项「AI 托管」。勾了多项时不要操作。
-- 界面上「已启动」后面的数字就是该 cmd 的进程号，可交给 AI 用 --console-tail 查看。
-- 没有命中、命中多项，或命中的不是准备调用的那一项，都不要操作，先问用户。
-- 不要根据代码内容猜测该启动哪一项。
+launcher.json 的 items 是可以调用的全部启动项。不在清单里的不要调用，并告诉用户启动器里没有这项。
+每一项有名称、source（vscode 或 idea）、工作目录 cwd、allowAgent，以及 members。members 有内容时，这一项是组合项，调用它就是启动、重启或关闭里面列出的那些项。
 
-启动、重启或关闭（action 写 start、restart 或 close；source 只能是 vscode 或 idea）：
+默认范围：本次改动的文件落在哪些项的工作目录里，就先在这些项里选。
+- 文件同时落在外层目录和里面的模块时，看改动影响的是外层还是里面。影响外层用外层的启动项，改动在里面用里面的启动项。
+- 同一工作目录有多项时，看对话上下文、改了什么、依赖关系、名称和是否正在运行，自己判断用哪一项。
+- 用户没有另外点名时，就在这个默认范围里选。用户点了其他服务，只要该项在清单里，也可以调用。用户明确说不要动的，不调用。
+- 没有改动文件、话又笼统时，从对话上下文判断是哪个项目、哪一项。仍然判断不了，或几项互相冲突，再问用户。
+- allowAgent 为 false 的项默认不调用。用户明确点了这项，先说明没勾「AI 托管」，用户确认后再调用。
+- 界面上「已启动」后面的数字就是该 cmd 的进程号，可交给 AI 用 --console-tail 查看。
+
+启动、重启或关闭（action 写 start、restart 或 close；source 只能是 vscode 或 idea）。有改动文件时带上 --file，没有也可以不带：
 python "<目录>\\start.py" --tell <窗口句柄> restart --project "<项目路径>" --source vscode --name "<配置名>" --file "<本次改动文件的绝对路径>"
-程序会核对文件路径。对不上就拒绝，不会操作。
+程序按你指定的项目、来源和名称执行，不再因为同一目录有多项或文件路径对不上而拒绝。
 
 查看该项 cmd 的启动输出。程序只返回末尾 40 行，不会把整个窗口内容交出来：
 python "<目录>\\start.py" --console-tail <cmdPid>
@@ -141,7 +144,7 @@ _user32.GetAncestor.restype = wintypes.HWND
 
 
 class LaunchItem:
-    def __init__(self, key, name, command, cwd, env, source, jdk_error="", config_path=""):
+    def __init__(self, key, name, command, cwd, env, source, jdk_error="", config_path="", members=None):
         self.key = key
         self.name = name
         self.command = command
@@ -150,6 +153,7 @@ class LaunchItem:
         self.source = source
         self.jdk_error = jdk_error
         self.config_path = config_path
+        self.members = list(members or [])
 
 
 class ToolTip:
@@ -592,9 +596,15 @@ def _resolve_idea(conf, project, index, config_path=""):
     if conf.get("temporary") == "true":
         return None
     kind = str(conf.get("type") or "")
-    if kind.lower() in _SKIP_TYPES or kind == "CompoundRunConfigurationType":
+    if kind.lower() in _SKIP_TYPES:
         return None
     name = _display_name(conf.get("name"))
+    if kind == "CompoundRunConfigurationType":
+        member_names = [node.get("name") for node in conf.findall("toRun") if node.get("name")]
+        if not member_names:
+            return None
+        item_key = f"{_norm(project)}|idea|{index}|{name}"
+        return LaunchItem(item_key, name, "", project, {}, "idea", config_path=config_path, members=member_names)
     module_name = ""
     module_node = conf.find("module")
     if module_node is not None and module_node.get("name"):
@@ -711,6 +721,15 @@ def discover(project):
             item = _resolve_vscode(cfg, project, index, launch_path)
             if item is not None:
                 items.append(item)
+        for index, compound in enumerate(data.get("compounds") or []):
+            member_names = [str(name) for name in (compound.get("configurations") or []) if str(name).strip()]
+            if not member_names:
+                continue
+            name = _display_name(compound.get("name"))
+            key = f"{_norm(project)}|vscode|compound|{index}|{name}"
+            items.append(LaunchItem(
+                key, name, "", project, {}, "vscode", config_path=launch_path, members=member_names,
+            ))
     seen = set()
     for path in _idea_files(project):
         try:
@@ -852,33 +871,14 @@ def _deepest(items, file_path):
     return kept
 
 
-def check_agent_call(items, project, source, name, file_path):
-    """返回 (命中的清单项, 拒绝原因)。拒绝时清单项为 None。"""
+def check_agent_call(items, project, source, name, file_path=""):
+    """返回 (命中的清单项, 拒绝原因)。拒绝时清单项为 None。文件路径只给 AI 判断，不在这里否决。"""
     if source not in {"vscode", "idea"}:
         return None, "来源只能是 vscode 或 idea，未操作。"
-    if not str(file_path or "").strip():
-        return None, "没有给出改动文件路径，未操作。"
-    file_path = os.path.abspath(file_path)
-    target = None
     for item in items:
         if catalog_key(item.get("project"), item.get("source"), item.get("name")) == catalog_key(project, source, name):
-            target = item
-            break
-    if target is None:
-        return None, "清单里没有这一项，未操作。"
-    matches = _deepest(items, file_path)
-    if not matches:
-        return None, "文件不在任何启动项的工作目录里，未操作。"
-    allowed = [item for item in matches if item.get("allowAgent")]
-    if len(matches) > 1 and len(allowed) != 1:
-        names = "、".join(item["name"] for item in matches)
-        return None, f"文件同时命中多项（{names}），未操作。"
-    hit = allowed[0] if len(allowed) == 1 else matches[0]
-    if catalog_key(hit.get("project"), hit.get("source"), hit.get("name")) != catalog_key(target.get("project"), target.get("source"), target.get("name")):
-        return None, f"文件落在「{hit.get('name')}」，与指定的「{target.get('name')}」不一致，未操作。"
-    if not hit.get("allowAgent"):
-        return None, "该项未勾选 AI 托管，未操作。"
-    return hit, ""
+            return item, ""
+    return None, "清单里没有这一项，未操作。"
 
 
 def _clip_chars(text, limit):
@@ -1121,13 +1121,16 @@ def build_items(projects, allow, hidden=None):
             if key in seen or key in hidden:
                 continue
             seen.add(key)
-            items.append({
+            row = {
                 "project": os.path.normpath(os.path.abspath(path)),
                 "source": item.source,
                 "name": item.name,
-                "cwd": os.path.normpath(os.path.abspath(item.cwd)),
+                "cwd": os.path.normpath(os.path.abspath(item.cwd)) if item.cwd else "",
                 "allowAgent": bool(allow.get(key, True)),
-            })
+            }
+            if item.members:
+                row["members"] = list(item.members)
+            items.append(row)
     return items
 
 
@@ -1511,6 +1514,7 @@ class Launcher:
         self.hidden = load_hidden()
         self.cards = {}
         self.shown = {}
+        self.item_by_key = {}
 
         bar = ttk.Frame(root)
         bar.pack(side="top", fill="x", padx=12, pady=(12, 4))
@@ -1839,6 +1843,7 @@ class Launcher:
         self.check_vars = []
         self.cards = {}
         self.shown = {}
+        self.item_by_key = {}
 
     def _drop_card(self, path):
         norm = _norm(path)
@@ -1847,6 +1852,9 @@ class Launcher:
             if key.startswith(prefix):
                 self.labels.pop(key, None)
         self.shown.pop(norm, None)
+        for key in list(self.item_by_key):
+            if key.startswith(prefix):
+                self.item_by_key.pop(key, None)
         frame = self.cards.pop(norm, None)
         if frame is not None and frame.winfo_exists():
             frame.destroy()
@@ -1935,7 +1943,9 @@ class Launcher:
         if not os.path.isdir(path):
             messagebox.showerror("无法启动", "路径不存在")
             return
-        items = list(self.shown.get(_norm(path), []))
+        listed = list(self.shown.get(_norm(path), []))
+        leaves = [item for item in listed if not item.members]
+        items = leaves or [item for item in listed if item.members]
         if not items:
             self.hint.config(text="这一侧没有可启动的配置")
             return
@@ -2045,12 +2055,15 @@ class Launcher:
             ToolTip(agent, "勾选后，AI 才能启动、重启或关闭这一项")
             name = self._selectable(row, item.name, max(8, min(36, len(item.name))))
             name.pack(side="left", padx=(8, 0))
+            if item.members:
+                ttk.Label(row, text="包含 " + "、".join(item.members), foreground="gray").pack(side="left")
             status = self._selectable(row, "未启动", 16)
             self._set_selectable(status, "未启动", "gray")
             status.pack(side="left", padx=8)
             if item.jdk_error:
                 ttk.Label(row, text=item.jdk_error, foreground="gray").pack(side="left")
             self.labels[item.key] = status
+            self.item_by_key[item.key] = item
             self._bind_item_menu(row, path, item)
         self._paint()
 
@@ -2060,6 +2073,17 @@ class Launcher:
 
     def _paint(self):
         for key, label in self.labels.items():
+            item = self.item_by_key.get(key)
+            if item is not None and item.members:
+                specs = self._member_specs(item)
+                running = [spec for spec in specs if self._running(spec.key)]
+                if specs and len(running) == len(specs):
+                    self._set_selectable(label, "已启动", "green")
+                elif running:
+                    self._set_selectable(label, f"已启动 {len(running)}/{len(specs)}", "green")
+                else:
+                    self._set_selectable(label, "未启动", "gray")
+                continue
             if self._running(key):
                 self._set_selectable(label, f"已启动 {self.procs[key].pid}", "green")
             else:
@@ -2109,7 +2133,26 @@ class Launcher:
         except OSError:
             pass
 
+    def _member_specs(self, item):
+        project = self._project_of(item)
+        try:
+            found = discover(project)
+        except OSError:
+            return []
+        specs = []
+        for name in item.members:
+            for spec in found:
+                if spec.source != item.source or spec.name != name:
+                    continue
+                if catalog_key(project, spec.source, spec.name) in self.hidden:
+                    continue
+                specs.append(spec)
+                break
+        return specs
+
     def start(self, item, interactive=True):
+        if item.members:
+            return self._start_members(item, interactive)
         if self._running(item.key):
             return True, "已在运行"
         if item.jdk_error:
@@ -2138,7 +2181,32 @@ class Launcher:
         self._paint()
         return True, "已启动"
 
+    def _start_members(self, item, interactive):
+        specs = self._member_specs(item)
+        if not specs:
+            message = "组合项里没有可启动的配置"
+            if interactive:
+                messagebox.showerror("无法启动", message)
+            return False, message
+        failures = []
+        for spec in specs:
+            ok, message = self.start(spec, interactive=False)
+            if not ok and message != "已在运行":
+                failures.append(f"{spec.name}：{message}")
+        self._paint()
+        if failures:
+            text = "\n".join(failures)
+            if interactive:
+                messagebox.showerror("有启动项没有启动", text)
+            return False, text
+        return True, "已启动"
+
     def close(self, item):
+        if item.members:
+            for spec in self._member_specs(item):
+                self.close(spec)
+            self._paint()
+            return
         proc = self.procs.get(item.key)
         if proc and proc.poll() is None:
             _kill(proc)
@@ -2152,6 +2220,12 @@ class Launcher:
         self._paint()
 
     def restart(self, item, interactive=True, on_done=None):
+        if item.members:
+            self.close(item)
+            ok, message = self.start(item, interactive=interactive)
+            if on_done:
+                on_done(ok, "已重启" if ok else message)
+            return
         old = self.procs.get(item.key)
         self.close(item)
 
@@ -2275,7 +2349,7 @@ class Launcher:
 def _print_cli_usage():
     print("查看输出：python start.py --console-tail <cmd进程号>")
     print("按关键字查：python start.py --console-find <cmd进程号> <关键字>")
-    print("启停：python start.py --tell <窗口句柄> start|restart|close --project <项目> --source vscode|idea --name <配置名> --file <改动文件>")
+    print("启停：python start.py --tell <窗口句柄> start|restart|close --project <项目> --source vscode|idea --name <配置名> [--file <改动文件>]")
 
 
 def _cli_stdout():
@@ -2323,10 +2397,10 @@ def cli_main(argv):
         except SystemExit:
             _print_cli_usage()
             return 2
-        if not args.tell or not args.action or not args.project or not args.source or not args.name or not args.file:
+        if not args.tell or not args.action or not args.project or not args.source or not args.name:
             _print_cli_usage()
             return 2
-        return tell_main(args.tell, args.action, args.project, args.source, args.name, args.file)
+        return tell_main(args.tell, args.action, args.project, args.source, args.name, args.file or "")
     _print_cli_usage()
     return 2
 
@@ -2353,7 +2427,7 @@ def tell_main(hwnd_text, action, project, source, name, file_path):
             "project": project,
             "source": source,
             "name": name,
-            "file": os.path.abspath(file_path),
+            "file": os.path.abspath(file_path) if file_path else "",
         },
     )
     result_path = os.path.join(folder, f"result-{request_id}.json")
