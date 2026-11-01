@@ -1,0 +1,7 @@
+{
+  "projects": [],
+  "items": [],
+  "usage": "这是服务启动器的说明。启动、重启、关闭都由正在运行的那个窗口执行。不要自己结束进程，也不要另起启动命令。\n\n窗口句柄和工具目录来自复制出来的文字。该窗口的运行记录在「目录\\run\\窗口句柄\\status.json」。\n记录里 cmdPid 是这一项当前 cmd 的进程号，cmdTitle 是窗口标题。state 为 running 时才能读取输出。\nerror 有内容时，表示 cmd 还没弹出就失败了，例如找不到 JDK。这份记录不是启动日志。\n\n选择启动项时，只根据本次改动文件的路径：\n- 文件要落在该项的工作目录里。同时落在上下两级目录时，取最深的那一项。\n- 恰好命中一项，并且该项 allowAgent 为 true，才可以操作。\n- 同一个目录有多项时，只勾选其中一项「AI 托管」。勾了多项时不要操作。\n- 界面上「已启动」后面的数字就是该 cmd 的进程号，可交给 AI 用 --console-tail 查看。\n- 没有命中、命中多项，或命中的不是准备调用的那一项，都不要操作，先问用户。\n- 不要根据代码内容猜测该启动哪一项。\n\n启动、重启或关闭（action 写 start、restart 或 close；source 只能是 vscode 或 idea）：\npython \"<目录>\\start.py\" --tell <窗口句柄> restart --project \"<项目路径>\" --source vscode --name \"<配置名>\" --file \"<本次改动文件的绝对路径>\"\n程序会核对文件路径。对不上就拒绝，不会操作。\n\n查看该项 cmd 的启动输出。程序只返回末尾 40 行，不会把整个窗口内容交出来：\npython \"<目录>\\start.py\" --console-tail <cmdPid>\n\n末尾不够时，按关键字再查。搜索在程序里完成，只返回命中行和前后各 2 行：\npython \"<目录>\\start.py\" --console-find <cmdPid> <关键字>\n\n窗口关掉之后，句柄和 cmdPid 都失效，需要用户从目标窗口重新复制。\n",
+  "closeRunning": "ask",
+  "showConsole": "show"
+}

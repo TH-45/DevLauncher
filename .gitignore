@@ -2,4 +2,4 @@ run/
 __pycache__/
 *.py[cod]
 .zhanlu/
-launcher.json
+# launcher.json
