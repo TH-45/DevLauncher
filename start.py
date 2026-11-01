@@ -141,7 +141,7 @@ _user32.GetAncestor.restype = wintypes.HWND
 
 
 class LaunchItem:
-    def __init__(self, key, name, command, cwd, env, source, jdk_error=""):
+    def __init__(self, key, name, command, cwd, env, source, jdk_error="", config_path=""):
         self.key = key
         self.name = name
         self.command = command
@@ -149,6 +149,7 @@ class LaunchItem:
         self.env = env
         self.source = source
         self.jdk_error = jdk_error
+        self.config_path = config_path
 
 
 class ToolTip:
@@ -548,7 +549,7 @@ def _envs(node, project, module_dir):
     return env
 
 
-def _resolve_vscode(cfg, project, index):
+def _resolve_vscode(cfg, project, index, config_path=""):
     if not isinstance(cfg, dict):
         return None
     if str(cfg.get("request") or "launch").lower() == "attach":
@@ -584,10 +585,10 @@ def _resolve_vscode(cfg, project, index):
     if not command:
         return None
     key = f"{_norm(project)}|vscode|{index}|{name}"
-    return LaunchItem(key, name, command, cwd or project, env, "vscode")
+    return LaunchItem(key, name, command, cwd or project, env, "vscode", config_path=config_path)
 
 
-def _resolve_idea(conf, project, index):
+def _resolve_idea(conf, project, index, config_path=""):
     if conf.get("temporary") == "true":
         return None
     kind = str(conf.get("type") or "")
@@ -666,7 +667,18 @@ def _resolve_idea(conf, project, index):
     for key, value in _envs(conf, project, module_dir).items():
         env[key] = value
     item_key = f"{_norm(project)}|idea|{index}|{name}"
-    return LaunchItem(item_key, name, command, cwd, env, "idea", jdk_error)
+    return LaunchItem(item_key, name, command, cwd, env, "idea", jdk_error, config_path)
+
+
+def _run_xml_files(folder):
+    """`.run` 里只认 *.run.xml，其他 xml 不读。"""
+    if not os.path.isdir(folder):
+        return []
+    return [
+        os.path.join(folder, name)
+        for name in sorted(os.listdir(folder))
+        if name.lower().endswith(".run.xml")
+    ]
 
 
 def _idea_files(project):
@@ -678,13 +690,12 @@ def _idea_files(project):
             for name in sorted(os.listdir(run_dir))
             if name.lower().endswith(".xml")
         )
-    dot_run = os.path.join(project, ".run")
-    if os.path.isdir(dot_run):
-        found.extend(
-            os.path.join(dot_run, name)
-            for name in sorted(os.listdir(dot_run))
-            if name.lower().endswith(".xml")
-        )
+    found.extend(_run_xml_files(os.path.join(project, ".run")))
+    project_norm = os.path.normcase(os.path.abspath(project))
+    for current, _filenames in _walk_limited(project):
+        if os.path.normcase(os.path.abspath(current)) == project_norm:
+            continue
+        found.extend(_run_xml_files(os.path.join(current, ".run")))
     workspace = os.path.join(project, ".idea", "workspace.xml")
     if os.path.isfile(workspace):
         found.append(workspace)
@@ -697,7 +708,7 @@ def discover(project):
     data = _read_json(launch_path) if os.path.isfile(launch_path) else None
     if isinstance(data, dict):
         for index, cfg in enumerate(data.get("configurations") or []):
-            item = _resolve_vscode(cfg, project, index)
+            item = _resolve_vscode(cfg, project, index, launch_path)
             if item is not None:
                 items.append(item)
     seen = set()
@@ -715,7 +726,7 @@ def discover(project):
             if marker in seen:
                 continue
             seen.add(marker)
-            item = _resolve_idea(conf, project, len(items) + index)
+            item = _resolve_idea(conf, project, len(items) + index, path)
             if item is not None:
                 items.append(item)
     return items
@@ -1075,7 +1086,27 @@ def load_allow():
     return allow
 
 
-def build_items(projects, allow):
+def load_hidden():
+    hidden = set()
+    for entry in _load_config().get("hidden") or []:
+        if not isinstance(entry, dict):
+            continue
+        if not entry.get("project") or not entry.get("source") or not entry.get("name"):
+            continue
+        hidden.add(catalog_key(entry.get("project"), entry.get("source"), entry.get("name")))
+    return hidden
+
+
+def _hidden_rows(hidden):
+    rows = []
+    for project, source, name in sorted(hidden):
+        rows.append({"project": project, "source": source, "name": name})
+    return rows
+
+
+def build_items(projects, allow, hidden=None):
+    if hidden is None:
+        hidden = load_hidden()
     items = []
     seen = set()
     for path in projects:
@@ -1087,7 +1118,7 @@ def build_items(projects, allow):
             continue
         for item in found:
             key = catalog_key(path, item.source, item.name)
-            if key in seen:
+            if key in seen or key in hidden:
                 continue
             seen.add(key)
             items.append({
@@ -1144,11 +1175,15 @@ def _keep_pref(payload, data, key, allowed):
         payload[key] = data[key]
 
 
-def save_config(projects, items):
+def save_config(projects, items, hidden=None):
     data = _load_config()
     payload = {"projects": projects, "items": items, "usage": _AGENT_USAGE}
     _keep_pref(payload, data, "closeRunning", (_CLOSE_ASK, _CLOSE_STOP, _CLOSE_LEAVE))
     _keep_pref(payload, data, "showConsole", (_CONSOLE_SHOW, _CONSOLE_MIN))
+    if hidden is None and isinstance(data.get("hidden"), list):
+        payload["hidden"] = data["hidden"]
+    elif hidden is not None:
+        payload["hidden"] = _hidden_rows(hidden)
     _write_json(CONFIG_PATH, payload)
 
 
@@ -1473,6 +1508,9 @@ class Launcher:
         self.projects = load_projects()
         self.saved = list(self.projects)
         self.allow = load_allow()
+        self.hidden = load_hidden()
+        self.cards = {}
+        self.shown = {}
 
         bar = ttk.Frame(root)
         bar.pack(side="top", fill="x", padx=12, pady=(12, 4))
@@ -1585,8 +1623,12 @@ class Launcher:
             return "skip"
         if _norm(path) in {_norm(item) for item in self.projects}:
             return "duplicate"
+        was_empty = not self.projects
         self.projects.append(path)
-        self._render()
+        if was_empty:
+            self._clear_body()
+        self._render_project(path)
+        self._refresh_hint()
         return "added"
 
     def _show_drop_hint(self):
@@ -1617,13 +1659,23 @@ class Launcher:
             self.hint.config(text="这个项目已经关联")
 
     def remove(self, path):
-        self.projects = [item for item in self.projects if _norm(item) != _norm(path)]
-        self.modes.pop(_norm(path), None)
-        self._render()
+        norm = _norm(path)
+        self.projects = [item for item in self.projects if _norm(item) != norm]
+        self.modes.pop(norm, None)
+        self.hidden = {key for key in self.hidden if key[0] != norm}
+        self._drop_card(path)
+        if not self.projects:
+            self._clear_body()
+            ttk.Label(
+                self.body,
+                text="尚未关联项目。选择目录后按该项目自己的启动配置显示按钮，点保存才会写入配置。",
+                foreground="gray",
+            ).pack(anchor="w", padx=8, pady=12)
+        self._refresh_hint()
 
     def save(self):
         try:
-            save_config(self.projects, build_items(self.projects, self.allow))
+            save_config(self.projects, build_items(self.projects, self.allow, self.hidden), self.hidden)
         except OSError as exc:
             messagebox.showerror("保存失败", str(exc))
             return
@@ -1631,11 +1683,14 @@ class Launcher:
         self._refresh_hint()
 
     def _persist_allow(self):
+        self._persist_saved()
+
+    def _persist_saved(self):
         if [_norm(path) for path in self.projects] != [_norm(path) for path in self.saved]:
             self._refresh_hint()
             return
         try:
-            save_config(self.saved, build_items(self.saved, self.allow))
+            save_config(self.saved, build_items(self.saved, self.allow, self.hidden), self.hidden)
         except OSError as exc:
             self.hint.config(text=str(exc))
 
@@ -1782,6 +1837,19 @@ class Launcher:
             child.destroy()
         self.labels = {}
         self.check_vars = []
+        self.cards = {}
+        self.shown = {}
+
+    def _drop_card(self, path):
+        norm = _norm(path)
+        prefix = norm + "|"
+        for key in list(self.labels):
+            if key.startswith(prefix):
+                self.labels.pop(key, None)
+        self.shown.pop(norm, None)
+        frame = self.cards.pop(norm, None)
+        if frame is not None and frame.winfo_exists():
+            frame.destroy()
 
     def _render(self):
         self._clear_body()
@@ -1803,7 +1871,57 @@ class Launcher:
         if self._mode(path) == mode:
             return
         self.modes[_norm(path)] = mode
-        self._render()
+        self._refresh_project(path)
+
+    def _refresh_project(self, path):
+        norm = _norm(path)
+        old = self.cards.get(norm)
+        before = None
+        if old is not None and old.winfo_exists():
+            slaves = list(old.master.pack_slaves())
+            if old in slaves:
+                index = slaves.index(old)
+                if index + 1 < len(slaves):
+                    before = slaves[index + 1]
+        self._drop_card(path)
+        self._render_project(path, before=before)
+
+    def _project_items(self, path):
+        mode = self._mode(path)
+        try:
+            found = discover(path)
+        except OSError:
+            found = []
+        visible = []
+        for item in found:
+            if item.source != mode:
+                continue
+            if catalog_key(path, item.source, item.name) in self.hidden:
+                continue
+            visible.append(item)
+        self._rekey_running(path, visible)
+        return visible
+
+    def _rekey_running(self, path, items):
+        prefix = _norm(path) + "|"
+        by_name = {}
+        for key, proc in list(self.procs.items()):
+            if not str(key).startswith(prefix):
+                continue
+            parts = str(key).split("|", 3)
+            if len(parts) == 4:
+                by_name[(parts[1], parts[3])] = key
+        for item in items:
+            old = by_name.get((item.source, item.name))
+            if not old or old == item.key:
+                continue
+            proc = self.procs.pop(old, None)
+            if proc is not None:
+                self.procs[item.key] = proc
+            meta = self.run_meta.pop(old, None)
+            if meta is not None:
+                meta["item"] = item
+                self.run_meta[item.key] = meta
 
     def _fit_project_header(self, header, width):
         width = max(int(width) - 24, 280)
@@ -1817,10 +1935,7 @@ class Launcher:
         if not os.path.isdir(path):
             messagebox.showerror("无法启动", "路径不存在")
             return
-        try:
-            items = [item for item in discover(path) if item.source == mode]
-        except OSError:
-            items = []
+        items = list(self.shown.get(_norm(path), []))
         if not items:
             self.hint.config(text="这一侧没有可启动的配置")
             return
@@ -1841,7 +1956,35 @@ class Launcher:
         else:
             self.hint.config(text=f"已一键启动 {side} 的 {started} 项")
 
-    def _render_project(self, path):
+    def _bind_item_menu(self, row, path, item):
+        menu = tk.Menu(row, tearoff=0)
+        menu.add_command(label="配置文件夹", command=lambda spec=item: self.open_config_file(spec))
+        menu.add_command(label="移除", command=lambda p=path, spec=item: self.hide_item(p, spec))
+
+        def popup(event, menu=menu):
+            menu.tk_popup(event.x_root, event.y_root)
+            menu.grab_release()
+
+        def bind_children(widget):
+            widget.bind("<Button-3>", popup)
+            for child in widget.winfo_children():
+                bind_children(child)
+
+        bind_children(row)
+
+    def open_config_file(self, item):
+        path = item.config_path or ""
+        if not path or not os.path.isfile(path):
+            self.hint.config(text="配置文件不存在")
+            return
+        subprocess.Popen(["explorer.exe", "/select,", os.path.normpath(path)])
+
+    def hide_item(self, path, item):
+        self.hidden.add(catalog_key(path, item.source, item.name))
+        self._persist_saved()
+        self._refresh_project(path)
+
+    def _render_project(self, path, before=None):
         mode = self._mode(path)
         header = ttk.Frame(self.body)
         header.pack_propagate(False)
@@ -1867,14 +2010,17 @@ class Launcher:
         ttk.Button(header, text="一键启动", command=lambda p=path: self.start_project(p)).place(relx=0.5, rely=0.5, anchor="center")
         frame = ttk.LabelFrame(self.body, labelwidget=header)
         frame.bind("<Configure>", lambda event, box=header: self._fit_project_header(box, event.width), add="+")
-        frame.pack(fill="x", padx=4, pady=6)
+        if before is not None:
+            frame.pack(fill="x", padx=4, pady=6, before=before)
+        else:
+            frame.pack(fill="x", padx=4, pady=6)
+        self.cards[_norm(path)] = frame
         if not os.path.isdir(path):
+            self.shown[_norm(path)] = []
             ttk.Label(frame, text="路径不存在", foreground="gray").pack(anchor="w", padx=8, pady=6)
             return
-        try:
-            items = [item for item in discover(path) if item.source == mode]
-        except OSError:
-            items = []
+        items = self._project_items(path)
+        self.shown[_norm(path)] = items
         if not items:
             ttk.Label(frame, text="这一侧没有可启动的配置", foreground="gray").pack(anchor="w", padx=8, pady=6)
             return
@@ -1905,6 +2051,7 @@ class Launcher:
             if item.jdk_error:
                 ttk.Label(row, text=item.jdk_error, foreground="gray").pack(side="left")
             self.labels[item.key] = status
+            self._bind_item_menu(row, path, item)
         self._paint()
 
     def _running(self, key):
