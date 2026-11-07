@@ -28,6 +28,8 @@ Windows 上的本地服务启动器。把项目目录关联进来后，按该项
 
 只显示当前这一侧的启动项。
 
+启动器只登记项目、配置名称和配置文件引用。每次启动或重启前都会重新读取对应配置文件中的命令、工作目录、环境变量和参数；修改 VS Code 配置后不需要重新登记启动器。
+
 ### 启动、重启、关闭
 
 每一项都有「启动」「重启」「关闭」。
@@ -55,7 +57,7 @@ AI 应读取该目录里的 `launcher.json`，并让**正在运行的这个窗�
 
 ### 本机配置
 
-`launcher.json` 保存在程序目录，不包含在仓库里。第一次保存或修改设置时会自动生成。别人克隆仓库后可以直接运行，项目列表一开始是空的。
+`launcher.json` 保存在程序目录，不包含在仓库里。它只保存项目/配置登记、AI 托管权限和界面设置，不保存 VS Code 启动命令的副本。第一次保存或修改设置时会自动生成。别人克隆仓库后可以直接运行，项目列表一开始是空的。
 
 `run\` 是窗口打开期间的运行记录，关闭窗口后删除，也不包含在仓库里。
 
@@ -94,6 +96,8 @@ Each project card switches between **VS Code** and **IDEA**:
 
 Only the selected side is listed.
 
+The launcher stores only project/configuration registrations. It rereads the selected configuration's command, working directory, environment, and arguments before every start or restart, so editing the VS Code configuration does not require re-registering it.
+
 ### Start, restart, and stop
 
 Each item has **启动**, **重启**, and **关闭**.
@@ -121,7 +125,7 @@ The AI should read `launcher.json` in that directory and let **this running wind
 
 ### Local configuration
 
-`launcher.json` lives next to the program and is not part of the repository. It is created on the first save or settings change. After a clone, the project list starts empty.
+`launcher.json` lives next to the program and is not part of the repository. It stores project/configuration registrations, AI permissions, and UI settings, but not a second copy of VS Code's launch command. It is created on the first save or settings change. After a clone, the project list starts empty.
 
 `run\` holds per-window runtime state while the launcher is open. It is removed when the window closes and is not part of the repository.
 

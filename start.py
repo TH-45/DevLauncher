@@ -1,7 +1,7 @@
 import sys
 import os
 
-_CLI_FLAGS = {"--tell", "--console-tail", "--console-find", "--console-read-worker"}
+_CLI_FLAGS = {"--agent", "--tell", "--list-items", "--status", "--console-tail", "--console-find", "--console-read-worker"}
 
 if __name__ == "__main__" and "--launched" not in sys.argv and not any(flag in sys.argv for flag in _CLI_FLAGS):
     import ctypes
@@ -23,6 +23,7 @@ if __name__ == "__main__" and "--launched" not in sys.argv and not any(flag in s
 
 import argparse
 import ctypes
+import hashlib
 import json
 import random
 import re
@@ -59,11 +60,11 @@ _AGENT_USAGE = """\
 这是服务启动器的说明。启动、重启、关闭都由正在运行的那个窗口执行。不要自己结束进程，也不要另起启动命令。
 
 窗口句柄和工具目录来自复制出来的文字。该窗口的运行记录在「目录\\run\\窗口句柄\\status.json」。
-记录里 cmdPid 是这一项当前 cmd 的进程号，cmdTitle 是窗口标题。state 为 running 时才能读取输出。
+记录里 cmdPid 是这一项当前 cmd 的进程号，cmdTitle 是窗口标题。state 为 starting、running、ready、started-unknown 时可读取输出。ready 表示命中就绪规则，started-unknown 表示没有配置就绪规则，沿用 cmd 已启动的兼容判断。
 error 有内容时，表示 cmd 还没弹出就失败了，例如找不到 JDK。这份记录不是启动日志。
 
 launcher.json 的 items 是可以调用的全部启动项。不在清单里的不要调用，并告诉用户启动器里没有这项。
-每一项有名称、source（vscode 或 idea）、工作目录 cwd、allowAgent，以及 members。members 有内容时，这一项是组合项，调用它就是启动、重启或关闭里面列出的那些项。
+每一项有 source、配置文件路径 configFile、配置名称 configName 和 allowAgent。启动参数、工作目录、环境变量和组合成员以项目配置文件当前内容为准，启动器不会把它们作为第二份配置维护。
 
 默认范围：本次改动的文件落在哪些项的工作目录里，就先在这些项里选。
 - 文件同时落在外层目录和里面的模块时，看改动影响的是外层还是里面。影响外层用外层的启动项，改动在里面用里面的启动项。
@@ -73,7 +74,7 @@ launcher.json 的 items 是可以调用的全部启动项。不在清单里的�
 - allowAgent 为 false 的项默认不调用。用户明确点了这项，先说明没勾「AI 托管」，用户确认后再调用。
 - 界面上「已启动」后面的数字就是该 cmd 的进程号，可交给 AI 用 --console-tail 查看。
 
-启动、重启或关闭（action 写 start、restart 或 close；source 只能是 vscode 或 idea）。有改动文件时带上 --file，没有也可以不带：
+先用 --list-items <窗口句柄> 查看当前实时启动项。启动、重启或关闭（action 写 start、restart 或 close；source 只能是 vscode 或 idea）。有改动文件时带上 --file，没有也可以不带：
 python "<目录>\\start.py" --tell <窗口句柄> restart --project "<项目路径>" --source vscode --name "<配置名>" --file "<本次改动文件的绝对路径>"
 程序按你指定的项目、来源和名称执行，不再因为同一目录有多项或文件路径对不上而拒绝。
 
@@ -459,7 +460,11 @@ def _idea_jdk_tables():
     if not os.path.isdir(root):
         return []
     found = []
-    for name in os.listdir(root):
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    for name in names:
         if not name.startswith("IntelliJIdea"):
             continue
         path = os.path.join(root, name, "options", "jdk.table.xml")
@@ -542,6 +547,21 @@ _IDEA_JDK_TYPES = {
     "MavenRunConfiguration",
     "GradleRunConfiguration",
 }
+
+
+def _env_file(path):
+    env = {}
+    text = _load_text(path)
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            env[key] = value
+    return env
 
 
 def _envs(node, project, module_dir):
@@ -674,6 +694,13 @@ def _resolve_idea(conf, project, index, config_path=""):
     jdk_error = ""
     if kind in _IDEA_JDK_TYPES:
         env, jdk_error = _idea_jdk_env(conf, project)
+    for option in conf.iter("option"):
+        if option.get("name") != "envFilePaths":
+            continue
+        for child in option.iter("option"):
+            env_path = _expand(child.get("value") or "", project, module_dir)
+            if env_path:
+                env.update(_env_file(env_path))
     for key, value in _envs(conf, project, module_dir).items():
         env[key] = value
     item_key = f"{_norm(project)}|idea|{index}|{name}"
@@ -749,6 +776,24 @@ def discover(project):
             if item is not None:
                 items.append(item)
     return items
+
+
+def _config_signature(project):
+    """返回项目启动配置的轻量签名，用于发现外部编辑后的变化。"""
+    paths = [os.path.join(project, ".vscode", "launch.json")]
+    try:
+        paths.extend(_idea_files(project))
+    except OSError:
+        pass
+    signature = []
+    for path in sorted(set(paths), key=lambda value: os.path.normcase(value)):
+        try:
+            stat = os.stat(path)
+        except OSError:
+            signature.append((os.path.normcase(path), False, 0, 0))
+            continue
+        signature.append((os.path.normcase(path), True, stat.st_mtime_ns, stat.st_size))
+    return tuple(signature)
 
 
 class _COORD(ctypes.Structure):
@@ -851,6 +896,19 @@ def catalog_key(project, source, name):
     return (_norm(project), source, name)
 
 
+def agent_item_id(project, source, name):
+    raw = f"{_norm(project)}|{source}|{name}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:12]
+
+
+def _entry_name(entry):
+    return entry.get("configName") or entry.get("name") or ""
+
+
+def _entry_config_file(entry):
+    return entry.get("configFile") or entry.get("configPath") or ""
+
+
 def _under_cwd(file_path, cwd):
     file_norm = _norm(file_path)
     cwd_norm = _norm(cwd)
@@ -876,7 +934,17 @@ def check_agent_call(items, project, source, name, file_path=""):
     if source not in {"vscode", "idea"}:
         return None, "来源只能是 vscode 或 idea，未操作。"
     for item in items:
-        if catalog_key(item.get("project"), item.get("source"), item.get("name")) == catalog_key(project, source, name):
+        if catalog_key(item.get("project"), item.get("source"), _entry_name(item)) == catalog_key(project, source, name):
+            if not bool(item.get("allowAgent", True)):
+                return None, "这一项没有勾选“AI 托管”，未操作。"
+            if file_path:
+                try:
+                    live = discover(item.get("project"))
+                    candidates = [spec for spec in live if spec.source == source and spec.name == name and _under_cwd(file_path, spec.cwd)]
+                    if not candidates:
+                        return None, "改动文件不在这一项的工作目录内，未操作。"
+                except OSError:
+                    return None, "项目配置无法读取，未操作。"
             return item, ""
     return None, "清单里没有这一项，未操作。"
 
@@ -1080,10 +1148,22 @@ def load_allow():
         for entry in data.get("items") or []:
             if not isinstance(entry, dict):
                 continue
-            if not entry.get("project") or not entry.get("source") or not entry.get("name"):
+            name = _entry_name(entry)
+            if not entry.get("project") or not entry.get("source") or not name:
                 continue
-            allow[catalog_key(entry.get("project"), entry.get("source"), entry.get("name"))] = bool(entry.get("allowAgent"))
+            allow[catalog_key(entry.get("project"), entry.get("source"), name)] = bool(entry.get("allowAgent"))
     return allow
+
+
+def load_ready_rule(project, source, name):
+    for entry in _load_config().get("items") or []:
+        if not isinstance(entry, dict):
+            continue
+        if catalog_key(entry.get("project"), entry.get("source"), _entry_name(entry)) != catalog_key(project, source, name):
+            continue
+        rule = entry.get("ready")
+        return rule if isinstance(rule, dict) else None
+    return None
 
 
 def load_hidden():
@@ -1091,9 +1171,9 @@ def load_hidden():
     for entry in _load_config().get("hidden") or []:
         if not isinstance(entry, dict):
             continue
-        if not entry.get("project") or not entry.get("source") or not entry.get("name"):
+        if not entry.get("project") or not entry.get("source") or not _entry_name(entry):
             continue
-        hidden.add(catalog_key(entry.get("project"), entry.get("source"), entry.get("name")))
+        hidden.add(catalog_key(entry.get("project"), entry.get("source"), _entry_name(entry)))
     return hidden
 
 
@@ -1108,6 +1188,7 @@ def build_items(projects, allow, hidden=None):
     if hidden is None:
         hidden = load_hidden()
     items = []
+    previous = _load_config().get("items") or []
     seen = set()
     for path in projects:
         if not os.path.isdir(path):
@@ -1124,12 +1205,19 @@ def build_items(projects, allow, hidden=None):
             row = {
                 "project": os.path.normpath(os.path.abspath(path)),
                 "source": item.source,
-                "name": item.name,
-                "cwd": os.path.normpath(os.path.abspath(item.cwd)) if item.cwd else "",
+                "configName": item.name,
                 "allowAgent": bool(allow.get(key, True)),
             }
-            if item.members:
-                row["members"] = list(item.members)
+            for old in previous:
+                if isinstance(old, dict) and catalog_key(old.get("project"), old.get("source"), _entry_name(old)) == key:
+                    if isinstance(old.get("ready"), dict):
+                        row["ready"] = old["ready"]
+                    break
+            if item.config_path:
+                try:
+                    row["configFile"] = os.path.relpath(item.config_path, path)
+                except ValueError:
+                    row["configFile"] = os.path.abspath(item.config_path)
             items.append(row)
     return items
 
@@ -1515,6 +1603,7 @@ class Launcher:
         self.cards = {}
         self.shown = {}
         self.item_by_key = {}
+        self.config_signatures = {}
 
         bar = ttk.Frame(root)
         bar.pack(side="top", fill="x", padx=12, pady=(12, 4))
@@ -1666,6 +1755,7 @@ class Launcher:
         norm = _norm(path)
         self.projects = [item for item in self.projects if _norm(item) != norm]
         self.modes.pop(norm, None)
+        self.config_signatures.pop(norm, None)
         self.hidden = {key for key in self.hidden if key[0] != norm}
         self._drop_card(path)
         if not self.projects:
@@ -1900,6 +1990,7 @@ class Launcher:
             found = discover(path)
         except OSError:
             found = []
+        self.config_signatures[_norm(path)] = _config_signature(path)
         visible = []
         for item in found:
             if item.source != mode:
@@ -2114,7 +2205,7 @@ class Launcher:
         for meta in self.run_meta.values():
             item = meta["item"]
             state = meta.get("state") or "stopped"
-            pid = meta.get("pid") if state == "running" else None
+            pid = meta.get("pid") if state in {"starting", "running", "ready", "running-unverified", "started-unknown"} else None
             items.append({
                 "project": self._project_of(item),
                 "source": item.source,
@@ -2124,6 +2215,7 @@ class Launcher:
                 "cmdToken": meta.get("token") or "",
                 "cmdTitle": meta.get("title") or "",
                 "error": meta.get("error") or "",
+                "ready": meta.get("ready") or {},
             })
         try:
             _write_json(
@@ -2150,7 +2242,35 @@ class Launcher:
                 break
         return specs
 
-    def start(self, item, interactive=True):
+    def _live_spec(self, item):
+        """启动动作发生时重新读取配置文件，不使用界面里可能过期的参数。"""
+        project = self._project_of(item)
+        try:
+            found = discover(project)
+        except OSError:
+            return None
+        fallback = None
+        for spec in found:
+            if spec.source != item.source or spec.name != item.name:
+                continue
+            if fallback is None:
+                fallback = spec
+            if item.config_path and _norm(spec.config_path) == _norm(item.config_path):
+                spec.key = item.key
+                return spec
+        if fallback is not None:
+            fallback.key = item.key
+        return fallback
+
+    def start(self, item, interactive=True, on_ready=None):
+        live = self._live_spec(item)
+        if live is None:
+            message = f"配置已不存在：{item.name}"
+            self._remember(item, "error", error=message)
+            if interactive:
+                messagebox.showerror("无法启动", message)
+            return False, message
+        item = live
         if item.members:
             return self._start_members(item, interactive)
         if self._running(item.key):
@@ -2177,9 +2297,41 @@ class Launcher:
             startupinfo=_console_startupinfo(),
         )
         self.procs[item.key] = proc
-        self._remember(item, "running", pid=proc.pid, token=token, title=title)
+        rule = load_ready_rule(self._project_of(item), item.source, item.name)
+        self._remember(item, "starting" if rule else "started-unknown", pid=proc.pid, token=token, title=title)
         self._paint()
-        return True, "已启动"
+        if rule:
+            self._watch_readiness(item, rule, on_ready)
+            return True, "正在等待服务就绪"
+        return True, "已启动，未配置就绪检查"
+
+    def _watch_readiness(self, item, rule, on_ready=None, started_at=None):
+        started_at = started_at or time.time()
+        proc = self.procs.get(item.key)
+        timeout = max(1, int(rule.get("timeout", 60)))
+        text = ""
+        if proc is not None and proc.poll() is not None:
+            self._remember(item, "failed", error=f"cmd 已退出，退出码 {proc.returncode}")
+            self._paint()
+            if on_ready:
+                on_ready(False, "启动失败，cmd 已退出")
+            return
+        if proc is not None:
+            text, _ = _attach_and_read(proc.pid)
+        patterns = [str(value).lower() for value in (rule.get("patterns") or []) if str(value).strip()]
+        if patterns and text and any(pattern in text.lower() for pattern in patterns):
+            self._remember(item, "ready", pid=proc.pid if proc else None)
+            self._paint()
+            if on_ready:
+                on_ready(True, "服务已就绪")
+            return
+        if time.time() - started_at >= timeout:
+            self._remember(item, "timeout", pid=proc.pid if proc else None, error=f"等待服务就绪超过 {timeout} 秒")
+            self._paint()
+            if on_ready:
+                on_ready(False, f"等待服务就绪超过 {timeout} 秒")
+            return
+        self.root.after(500, lambda: self._watch_readiness(item, rule, on_ready, started_at))
 
     def _start_members(self, item, interactive):
         specs = self._member_specs(item)
@@ -2222,8 +2374,8 @@ class Launcher:
     def restart(self, item, interactive=True, on_done=None):
         if item.members:
             self.close(item)
-            ok, message = self.start(item, interactive=interactive)
-            if on_done:
+            ok, message = self.start(item, interactive=interactive, on_ready=on_done)
+            if on_done and not load_ready_rule(self._project_of(item), item.source, item.name):
                 on_done(ok, "已重启" if ok else message)
             return
         old = self.procs.get(item.key)
@@ -2242,7 +2394,7 @@ class Launcher:
     def _sync_runtime(self):
         changed = False
         for key, meta in self.run_meta.items():
-            if meta.get("state") != "running":
+            if meta.get("state") not in {"starting", "running", "ready", "running-unverified", "started-unknown"}:
                 continue
             proc = self.procs.get(key)
             if proc is None or proc.poll() is not None:
@@ -2251,6 +2403,18 @@ class Launcher:
                 changed = True
         if changed:
             self._write_runtime()
+
+    def _refresh_changed_projects(self):
+        """配置文件由 VS Code 或外部编辑器改动后，刷新当前项目卡片。"""
+        for path in list(self.projects):
+            norm = _norm(path)
+            current = _config_signature(path)
+            previous = self.config_signatures.get(norm)
+            if previous is None:
+                self.config_signatures[norm] = current
+                continue
+            if current != previous:
+                self._refresh_project(path)
 
     def _finish_agent(self, request_id, ok, message):
         if not self.hwnd or not request_id:
@@ -2273,12 +2437,16 @@ class Launcher:
             return None
         fallback = None
         for item in found:
-            if item.source != catalog_item.get("source") or item.name != catalog_item.get("name"):
+            if item.source != catalog_item.get("source") or item.name != _entry_name(catalog_item):
                 continue
             if fallback is None:
                 fallback = item
-            if _norm(item.cwd) == _norm(catalog_item.get("cwd") or ""):
-                return item
+            registered_path = _entry_config_file(catalog_item)
+            if registered_path:
+                if not os.path.isabs(registered_path):
+                    registered_path = os.path.join(project, registered_path)
+                if _norm(item.config_path) == _norm(registered_path):
+                    return item
         return fallback
 
     def _run_agent_command(self, data):
@@ -2302,8 +2470,14 @@ class Launcher:
                 return
             action = data.get("action")
             if action == "start":
-                ok, message = self.start(spec, interactive=False)
-                self._finish_agent(request_id, ok, message)
+                rule = load_ready_rule(self._project_of(spec), spec.source, spec.name)
+                ok, message = self.start(
+                    spec,
+                    interactive=False,
+                    on_ready=lambda ready_ok, ready_message, ident=request_id: self._finish_agent(ident, ready_ok, ready_message),
+                )
+                if not rule:
+                    self._finish_agent(request_id, ok, message)
             elif action == "close":
                 self.close(spec)
                 self._finish_agent(request_id, True, "已关闭")
@@ -2338,6 +2512,7 @@ class Launcher:
 
     def _poll(self):
         try:
+            self._refresh_changed_projects()
             self._paint()
             self._sync_runtime()
             self._take_commands()
@@ -2347,6 +2522,8 @@ class Launcher:
 
 
 def _print_cli_usage():
+    print("列出当前启动项：python start.py --list-items <窗口句柄>")
+    print("查看运行状态：python start.py --status <窗口句柄>")
     print("查看输出：python start.py --console-tail <cmd进程号>")
     print("按关键字查：python start.py --console-find <cmd进程号> <关键字>")
     print("启停：python start.py --tell <窗口句柄> start|restart|close --project <项目> --source vscode|idea --name <配置名> [--file <改动文件>]")
@@ -2368,6 +2545,18 @@ def cli_main(argv):
         mode = argv[index + 2]
         keyword = " ".join(argv[index + 3 :])
         return console_worker(pid, mode, keyword)
+    if "--list-items" in argv:
+        index = argv.index("--list-items")
+        if index + 1 >= len(argv):
+            _print_cli_usage()
+            return 2
+        return list_items_main(argv[index + 1])
+    if "--status" in argv:
+        index = argv.index("--status")
+        if index + 1 >= len(argv):
+            _print_cli_usage()
+            return 2
+        return status_main(argv[index + 1])
     if "--console-tail" in argv:
         index = argv.index("--console-tail")
         if index + 1 >= len(argv):
@@ -2403,6 +2592,56 @@ def cli_main(argv):
         return tell_main(args.tell, args.action, args.project, args.source, args.name, args.file or "")
     _print_cli_usage()
     return 2
+
+
+def _runtime_payload(hwnd_text):
+    parsed = _parse_hwnd(hwnd_text)
+    if parsed is None:
+        return None
+    path = os.path.join(_run_folder(_format_hwnd(parsed)), "status.json")
+    return _read_json(path) if os.path.isfile(path) else None
+
+
+def list_items_main(hwnd_text):
+    status = _runtime_payload(hwnd_text) or {}
+    running = {(item.get("project"), item.get("source"), item.get("name")): item for item in status.get("items", []) if isinstance(item, dict)}
+    output = []
+    for project in load_projects():
+        try:
+            found = discover(project)
+        except OSError:
+            continue
+        allow = load_allow()
+        for spec in found:
+            key = catalog_key(project, spec.source, spec.name)
+            row = {
+                "project": os.path.normpath(os.path.abspath(project)),
+                "source": spec.source,
+                "name": spec.name,
+                "configFile": os.path.relpath(spec.config_path, project) if spec.config_path else "",
+                "cwd": spec.cwd,
+                "allowAgent": bool(allow.get(key, True)),
+                "state": "stopped",
+                "cmdPid": None,
+                "error": "",
+            }
+            live = running.get((row["project"], row["source"], row["name"])) or running.get((project, row["source"], row["name"]))
+            if live:
+                row["state"] = live.get("state", "stopped")
+                row["cmdPid"] = live.get("cmdPid")
+                row["error"] = live.get("error", "")
+            output.append(row)
+    print(json.dumps({"ok": True, "items": output}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def status_main(hwnd_text):
+    data = _runtime_payload(hwnd_text)
+    if not isinstance(data, dict):
+        print(json.dumps({"ok": False, "error": "窗口未打开或状态不存在"}, ensure_ascii=False))
+        return 1
+    print(json.dumps({"ok": True, **data}, ensure_ascii=False, indent=2))
+    return 0
 
 
 def tell_main(hwnd_text, action, project, source, name, file_path):
