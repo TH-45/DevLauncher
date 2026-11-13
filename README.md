@@ -38,7 +38,7 @@ Windows 上的本地服务启动器。把项目目录关联进来后，按该项
 
 每一项都有「启动」「重启」「关闭」。
 
-「一键启动」在项目卡片顶边中间，只启动**当前这一侧**列出的全部配置。已经在运行的会跳过。
+「一键启动」位于「启动」「重启」「关闭」按钮组正上方，只启动**当前这一侧**列出的全部配置。已经在运行的会跳过。
 
 状态为「已启动」时，后面的数字是该 cmd 的进程号。
 
@@ -107,7 +107,7 @@ The launcher stores only project/configuration registrations. It rereads the sel
 
 Each item has **启动**, **重启**, and **关闭**.
 
-**一键启动**, centered on the project card, starts every configuration on the **current side**. Items that are already running are skipped.
+**一键启动**, centered above the three action buttons, starts every configuration on the **current side**. Items that are already running are skipped.
 
 While an item is running, the number after **已启动** is the cmd process id.
 

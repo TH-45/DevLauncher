@@ -2252,10 +2252,13 @@ class Launcher:
         left = ttk.Frame(header)
         controls = ttk.Frame(left)
         controls.pack(side="right")
-        title = self._name_label(left, os.path.basename(path) or path, path)
-        title.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        title_text = os.path.basename(path) or path
+        title = self._name_label(left, title_text, path)
+        title_gap = 36
+        title.pack(side="left", fill="both", expand=True, padx=(0, title_gap))
         menu = tk.Menu(title, tearoff=False)
         menu.add_command(label="项目文件夹", command=lambda p=path: self._visit_directory(p))
+        menu.add_command(label="移除", command=lambda p=path: self.remove(p))
         self._bind_context_menu(menu, title)
         tk.Button(
             controls,
@@ -2269,10 +2272,24 @@ class Launcher:
             relief="sunken" if mode == "idea" else "raised",
             command=lambda p=path: self._set_mode(p, "idea"),
         ).pack(side="left", padx=(2, 0))
-        ttk.Button(controls, text="移除", width=4, command=lambda p=path: self.remove(p)).pack(side="left", padx=(8, 0))
         start_all = ttk.Button(header, text="一键启动", command=lambda p=path: self.start_project(p))
-        start_all.place(relx=0.5, rely=0.5, anchor="center")
-        left.place(relwidth=0.5, width=-(start_all.winfo_reqwidth() // 2 + 8), relheight=1)
+        start_all.place(relx=1, rely=0.5, x=-48, anchor="center")
+        title_font = ttk.Style(title).lookup("TLabel", "font") or "TkDefaultFont"
+        title_width = tkfont.Font(root=title, font=title_font).measure(title_text)
+        buttons_anchor = None
+
+        def align_actions(_event):
+            center = header.winfo_width() - 48
+            if buttons_anchor is not None and buttons_anchor.winfo_width() > 1:
+                center = buttons_anchor.winfo_rootx() - header.winfo_rootx() + buttons_anchor.winfo_width() // 2
+            start_all.place_configure(relx=0, x=center)
+            preferred = title_width + title_gap + controls.winfo_reqwidth()
+            available = center - (start_all.winfo_reqwidth() + 1) // 2 - 8
+            left.place_configure(width=max(1, min(preferred, available)))
+
+        left.place(width=1, relheight=1)
+        header.bind("<Configure>", align_actions, add="+")
+        controls.bind("<Configure>", align_actions, add="+")
         frame = ttk.LabelFrame(self.body, labelwidget=header)
         frame.bind("<Configure>", lambda event, box=header: self._fit_project_header(box, event.width), add="+")
         if before is not None:
@@ -2297,6 +2314,9 @@ class Launcher:
             ttk.Button(buttons, text="启动", width=6, command=lambda spec=item: self.start(spec)).pack(side="left", padx=2)
             ttk.Button(buttons, text="重启", width=6, command=lambda spec=item: self.restart(spec)).pack(side="left", padx=2)
             ttk.Button(buttons, text="关闭", width=6, command=lambda spec=item: self.close(spec)).pack(side="left", padx=2)
+            if buttons_anchor is None:
+                buttons_anchor = buttons
+                buttons.bind("<Configure>", align_actions, add="+")
             allow_key = catalog_key(path, item.source, item.name)
             checked = tk.BooleanVar(value=self.allow.get(allow_key, True))
             self.check_vars.append(checked)
@@ -2306,7 +2326,7 @@ class Launcher:
                 self._persist_allow()
 
             agent = ttk.Checkbutton(row, text="AI 托管", variable=checked, command=toggle)
-            agent.pack(side="left")
+            agent.pack(side="right", padx=(4, 2))
             ToolTip(agent, "勾选后，AI 才能启动、重启或关闭这一项")
             name = self._selectable(row, item.name, max(8, min(36, len(item.name))))
             name.pack(side="left", padx=(8, 0))
