@@ -35,6 +35,7 @@ import xml.etree.ElementTree as ET
 from ctypes import wintypes
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "launcher.json")
@@ -42,6 +43,7 @@ COPY_PROMPT_PATH = os.path.join(APP_DIR, "复制提示词.txt")
 RUN_DIR = os.path.join(APP_DIR, "run")
 CREATE_NEW_CONSOLE = 0x00000010
 CREATE_NO_WINDOW = 0x08000000
+SCRIPT_EXTENSIONS = {".ps1", ".bat", ".cmd"}
 _WM_CLOSE = 0x0010
 _GA_ROOT = 2
 _STD_OUTPUT_HANDLE = wintypes.DWORD(-11)
@@ -167,6 +169,7 @@ class ToolTip:
         widget.bind("<Enter>", self._schedule, add="+")
         widget.bind("<Leave>", self._hide, add="+")
         widget.bind("<ButtonPress>", self._hide, add="+")
+        widget.bind("<Destroy>", self._hide, add="+")
 
     def _schedule(self, _event):
         self._hide()
@@ -1227,12 +1230,23 @@ _CLOSE_STOP = "stop"
 _CLOSE_LEAVE = "leave"
 _CONSOLE_SHOW = "show"
 _CONSOLE_MIN = "min"
+_CONSOLE_HIDE = "hide"
 _SW_SHOWMINNOACTIVE = 7
 
 
 def _load_config():
     data = _read_json(CONFIG_PATH) if os.path.isfile(CONFIG_PATH) else None
     return data if isinstance(data, dict) else {}
+
+
+def load_scripts():
+    paths = _load_config().get("scripts")
+    scripts = {}
+    if isinstance(paths, list):
+        for path in paths:
+            if isinstance(path, str) and os.path.isabs(path) and _is_script(path):
+                scripts.setdefault(_norm(path), os.path.normpath(path))
+    return list(scripts.values())
 
 
 def load_close_pref():
@@ -1249,12 +1263,18 @@ def load_console_pref():
     return value
 
 
-def save_ui_prefs(close_running=None, show_console=None):
+def load_script_console_pref():
+    return _CONSOLE_HIDE if _load_config().get("scriptConsole") == _CONSOLE_HIDE else _CONSOLE_SHOW
+
+
+def save_ui_prefs(close_running=None, show_console=None, script_console=None):
     data = _load_config()
     if close_running is not None:
         data["closeRunning"] = close_running if close_running in (_CLOSE_ASK, _CLOSE_STOP, _CLOSE_LEAVE) else _CLOSE_ASK
     if show_console is not None:
         data["showConsole"] = show_console if show_console in (_CONSOLE_SHOW, _CONSOLE_MIN) else _CONSOLE_SHOW
+    if script_console is not None:
+        data["scriptConsole"] = script_console if script_console in (_CONSOLE_SHOW, _CONSOLE_HIDE) else _CONSOLE_SHOW
     data.setdefault("projects", [])
     data.setdefault("items", [])
     data.setdefault("usage", _AGENT_USAGE)
@@ -1266,11 +1286,16 @@ def _keep_pref(payload, data, key, allowed):
         payload[key] = data[key]
 
 
-def save_config(projects, items, hidden=None):
+def save_config(projects, items, hidden=None, scripts=None):
     data = _load_config()
     payload = {"projects": projects, "items": items, "usage": _AGENT_USAGE}
+    if scripts is not None:
+        payload["scripts"] = scripts
+    elif isinstance(data.get("scripts"), list):
+        payload["scripts"] = data["scripts"]
     _keep_pref(payload, data, "closeRunning", (_CLOSE_ASK, _CLOSE_STOP, _CLOSE_LEAVE))
     _keep_pref(payload, data, "showConsole", (_CONSOLE_SHOW, _CONSOLE_MIN))
+    _keep_pref(payload, data, "scriptConsole", (_CONSOLE_SHOW, _CONSOLE_HIDE))
     if hidden is None and isinstance(data.get("hidden"), list):
         payload["hidden"] = data["hidden"]
     elif hidden is not None:
@@ -1286,6 +1311,37 @@ def _console_startupinfo():
     info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     info.wShowWindow = _SW_SHOWMINNOACTIVE
     return info
+
+
+def _is_script(path):
+    return os.path.splitext(path)[1].lower() in SCRIPT_EXTENSIONS
+
+
+def launch_script(path):
+    if not _is_script(path) or not os.path.isfile(path):
+        raise OSError(f"找不到可执行的脚本：{path}")
+    env = os.environ.copy()
+    env["STARTER_SCRIPT_PATH"] = path
+    hidden = load_script_console_pref() == _CONSOLE_HIDE
+    if os.path.splitext(path)[1].lower() == ".ps1":
+        command = ["powershell.exe", "-NoProfile"]
+        if hidden:
+            command.append("-NonInteractive")
+        command.extend(["-File", path])
+        if not hidden:
+            command = 'cmd.exe /d /v:off /k powershell.exe -NoProfile -File "%STARTER_SCRIPT_PATH%"'
+    else:
+        # Expand the path in the child cmd only, so percent signs stay literal.
+        command = 'cmd.exe /d /v:off /s /c ""%STARTER_SCRIPT_PATH%""'
+        if not hidden:
+            env["STARTER_SCRIPT_COMMAND"] = command
+            command = 'cmd.exe /d /v:off /k %STARTER_SCRIPT_COMMAND%'
+    return subprocess.Popen(
+        command,
+        cwd=os.path.dirname(path),
+        env=env,
+        creationflags=CREATE_NO_WINDOW if hidden else CREATE_NEW_CONSOLE,
+    )
 
 
 def save_projects(paths):
@@ -1598,6 +1654,8 @@ class Launcher:
         self._drop_revoke = None
         self.projects = load_projects()
         self.saved = list(self.projects)
+        self.scripts = load_scripts()
+        self.saved_scripts = list(self.scripts)
         self.allow = load_allow()
         self.hidden = load_hidden()
         self.cards = {}
@@ -1621,9 +1679,13 @@ class Launcher:
 
         self.canvas = tk.Canvas(root, highlightthickness=0)
         self.scroll = ttk.Scrollbar(root, orient="vertical", command=self.canvas.yview)
-        self.body = ttk.Frame(self.canvas)
-        self.body.bind("<Configure>", lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.window_id = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
+        content = ttk.Frame(self.canvas)
+        content.bind("<Configure>", lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.window_id = self.canvas.create_window((0, 0), window=content, anchor="nw")
+        self.script_panel = ttk.LabelFrame(content, text="脚本")
+        self.script_panel.pack(fill="x", padx=8, pady=(4, 8))
+        self.body = ttk.Frame(content)
+        self.body.pack(fill="x")
         self.canvas.configure(yscrollcommand=self.scroll.set)
         self.canvas.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=4)
         self.scroll.pack(side="right", fill="y", padx=(0, 8), pady=4)
@@ -1633,9 +1695,10 @@ class Launcher:
         self.drop_cover = tk.Frame(root, bg="#eef5ff", highlightthickness=3, highlightbackground="#4c8dff")
         drop_box = tk.Frame(self.drop_cover, bg="#eef5ff")
         drop_box.place(relx=0.5, rely=0.5, anchor="center")
-        tk.Label(drop_box, text="拖入关联项目", bg="#eef5ff", font=("", 18)).pack()
-        tk.Label(drop_box, text="文件夹或快捷方式关联其目录，文件关联它所在的目录", bg="#eef5ff", fg="#667085").pack(pady=(8, 0))
+        tk.Label(drop_box, text="拖入项目或脚本", bg="#eef5ff", font=("", 18)).pack()
+        tk.Label(drop_box, text=".ps1、.bat、.cmd 文件加入脚本列表，其他文件关联其目录", bg="#eef5ff", fg="#667085").pack(pady=(8, 0))
         tk.Label(drop_box, text="松开后加入列表，点保存才会保留", bg="#eef5ff", fg="#667085").pack(pady=(4, 0))
+        self._render_scripts()
         self._render()
         self._place_center(760, 480)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1699,10 +1762,83 @@ class Launcher:
         self.canvas.yview_scroll(int(-event.delta / 120), "units")
 
     def _refresh_hint(self):
-        if [_norm(path) for path in self.projects] == [_norm(path) for path in self.saved]:
-            self.hint.config(text="已保存，下次打开会直接出现这些项目")
+        if self.projects == self.saved and self.scripts == self.saved_scripts:
+            self.hint.config(text="已保存")
         else:
-            self.hint.config(text="未保存，关闭后这次关联不会保留")
+            self.hint.config(text="有未保存的更改")
+
+    def _name_label(self, parent, text, path):
+        label = ttk.Label(parent)
+        font_name = ttk.Style(label).lookup("TLabel", "font") or "TkDefaultFont"
+        font = tkfont.Font(root=label, font=font_name)
+
+        def fit(event):
+            width = event.width
+            if font.measure(text) <= width:
+                label.configure(text=text)
+                return
+            low, high = 0, len(text)
+            while low < high:
+                mid = (low + high + 1) // 2
+                if font.measure(text[:mid] + "…") <= width:
+                    low = mid
+                else:
+                    high = mid - 1
+            label.configure(text=text[:low] + "…" if font.measure("…") <= width else "")
+
+        label.bind("<Configure>", fit)
+        ToolTip(label, path)
+        return label
+
+    @staticmethod
+    def _bind_context_menu(menu, *widgets):
+        def popup(event):
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        for widget in widgets:
+            widget.bind("<Button-3>", popup)
+
+    def _visit_directory(self, path):
+        if not os.path.isdir(path):
+            messagebox.showerror("目录不可用", path, parent=self.root)
+            return
+        try:
+            os.startfile(path)
+        except OSError as exc:
+            messagebox.showerror("目录不可用", str(exc), parent=self.root)
+
+    def _render_scripts(self):
+        for child in self.script_panel.winfo_children():
+            child.destroy()
+        if not self.scripts:
+            ttk.Label(self.script_panel, text="拖入脚本文件即可添加", foreground="gray").pack(
+                anchor="w", padx=8, pady=5,
+            )
+        for path in self.scripts:
+            row = ttk.Frame(self.script_panel)
+            row.pack(fill="x", padx=8, pady=2)
+            name = self._name_label(row, os.path.basename(path), path)
+            menu = tk.Menu(row, tearoff=False)
+            menu.add_command(label="所在目录", command=lambda path=path: self._visit_directory(os.path.dirname(path)))
+            menu.add_command(label="移除", command=lambda path=path: self._remove_script(path))
+            button = ttk.Button(row, text="启动", command=lambda path=path: self._start_script(path))
+            button.pack(side="right")
+            name.pack(side="left", fill="both", expand=True, padx=(0, 8))
+            self._bind_context_menu(menu, row, name, button)
+
+    def _remove_script(self, path):
+        self.scripts.remove(path)
+        self._render_scripts()
+        self._refresh_hint()
+
+    def _start_script(self, path):
+        try:
+            launch_script(path)
+        except OSError as exc:
+            messagebox.showerror("无法启动脚本", str(exc), parent=self.root)
 
     def associate(self):
         path = filedialog.askdirectory(title="关联项目", initialdir=self.projects[-1] if self.projects else APP_DIR)
@@ -1739,7 +1875,19 @@ class Launcher:
         added = False
         duplicate = False
         seen = set()
+        script_paths = {_norm(path) for path in self.scripts}
+        script_added = False
         for raw in paths:
+            if _is_script(raw) and os.path.isfile(raw):
+                path = os.path.abspath(raw)
+                key = _norm(path)
+                if key in script_paths:
+                    duplicate = True
+                else:
+                    self.scripts.append(path)
+                    script_paths.add(key)
+                    script_added = True
+                continue
             path = project_from_drop(raw)
             if not path or _norm(path) in seen:
                 continue
@@ -1748,8 +1896,12 @@ class Launcher:
             added = added or result == "added"
             duplicate = duplicate or result == "duplicate"
         self._hide_drop_hint()
-        if not added and duplicate:
-            self.hint.config(text="这个项目已经关联")
+        if script_added:
+            self._render_scripts()
+            self.canvas.yview_moveto(0)
+            self._refresh_hint()
+        elif not added and duplicate:
+            self.hint.config(text="该项目或脚本已添加")
 
     def remove(self, path):
         norm = _norm(path)
@@ -1769,11 +1921,12 @@ class Launcher:
 
     def save(self):
         try:
-            save_config(self.projects, build_items(self.projects, self.allow, self.hidden), self.hidden)
+            save_config(self.projects, build_items(self.projects, self.allow, self.hidden), self.hidden, scripts=self.scripts)
         except OSError as exc:
             messagebox.showerror("保存失败", str(exc))
             return
         self.saved = list(self.projects)
+        self.saved_scripts = list(self.scripts)
         self._refresh_hint()
 
     def _persist_allow(self):
@@ -1856,22 +2009,28 @@ class Launcher:
         dialog.withdraw()
         choice = tk.StringVar(value=load_close_pref())
         console = tk.StringVar(value=load_console_pref())
+        script_console = tk.StringVar(value=load_script_console_pref())
         group = ttk.LabelFrame(dialog, text="关闭启动器时")
         group.pack(fill="x", padx=16, pady=(16, 8))
         ttk.Radiobutton(group, text="每次询问", value=_CLOSE_ASK, variable=choice).pack(anchor="w", padx=12, pady=(8, 2))
         ttk.Radiobutton(group, text="关闭正在运行的服务", value=_CLOSE_STOP, variable=choice).pack(anchor="w", padx=12, pady=2)
         ttk.Radiobutton(group, text="不关闭服务，只关窗口", value=_CLOSE_LEAVE, variable=choice).pack(anchor="w", padx=12, pady=(2, 10))
-        console_group = ttk.LabelFrame(dialog, text="启动时的 cmd 窗口")
+        console_group = ttk.LabelFrame(dialog, text="项目控制台")
         console_group.pack(fill="x", padx=16, pady=(0, 8))
         ttk.Radiobutton(console_group, text="弹出", value=_CONSOLE_SHOW, variable=console).pack(anchor="w", padx=12, pady=(8, 2))
         ttk.Radiobutton(console_group, text="最小化到任务栏", value=_CONSOLE_MIN, variable=console).pack(anchor="w", padx=12, pady=(2, 10))
-        ttk.Frame(dialog, height=36).pack(fill="x")
+        script_group = ttk.LabelFrame(dialog, text="脚本控制台")
+        script_group.pack(fill="x", padx=16, pady=(0, 8))
+        ttk.Radiobutton(script_group, text="显示", value=_CONSOLE_SHOW, variable=script_console).pack(anchor="w", padx=12, pady=(8, 2))
+        ttk.Radiobutton(script_group, text="隐藏", value=_CONSOLE_HIDE, variable=script_console).pack(anchor="w", padx=12, pady=(2, 10))
         buttons = ttk.Frame(dialog)
         buttons.pack(side="bottom", fill="x", padx=16, pady=16)
 
         def ok():
             try:
-                save_ui_prefs(close_running=choice.get(), show_console=console.get())
+                save_ui_prefs(
+                    close_running=choice.get(), show_console=console.get(), script_console=script_console.get(),
+                )
             except OSError as exc:
                 messagebox.showerror("保存失败", str(exc), parent=dialog)
                 return
@@ -1879,7 +2038,8 @@ class Launcher:
 
         ttk.Button(buttons, text="取消", width=8, command=dialog.destroy).pack(side="right")
         ttk.Button(buttons, text="确定", width=8, command=ok).pack(side="right", padx=(0, 8))
-        self._center_dialog(dialog, 340, 320)
+        dialog.update_idletasks()
+        self._center_dialog(dialog, max(340, dialog.winfo_reqwidth()), dialog.winfo_reqheight())
         dialog.deiconify()
         dialog.grab_set()
         dialog.wait_window()
@@ -2090,25 +2250,29 @@ class Launcher:
         header = ttk.Frame(self.body)
         header.pack_propagate(False)
         left = ttk.Frame(header)
-        left.pack(side="left", fill="y")
-        title_text = os.path.basename(path) or path
-        title = self._selectable(left, title_text, max(8, min(36, len(title_text))))
-        title.pack(side="left")
-        ToolTip(title, path)
+        controls = ttk.Frame(left)
+        controls.pack(side="right")
+        title = self._name_label(left, os.path.basename(path) or path, path)
+        title.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        menu = tk.Menu(title, tearoff=False)
+        menu.add_command(label="项目文件夹", command=lambda p=path: self._visit_directory(p))
+        self._bind_context_menu(menu, title)
         tk.Button(
-            left,
+            controls,
             text="VS Code",
             relief="sunken" if mode == "vscode" else "raised",
             command=lambda p=path: self._set_mode(p, "vscode"),
-        ).pack(side="left", padx=(8, 0))
+        ).pack(side="left")
         tk.Button(
-            left,
+            controls,
             text="IDEA",
             relief="sunken" if mode == "idea" else "raised",
             command=lambda p=path: self._set_mode(p, "idea"),
         ).pack(side="left", padx=(2, 0))
-        ttk.Button(left, text="移除", width=4, command=lambda p=path: self.remove(p)).pack(side="left", padx=(8, 0))
-        ttk.Button(header, text="一键启动", command=lambda p=path: self.start_project(p)).place(relx=0.5, rely=0.5, anchor="center")
+        ttk.Button(controls, text="移除", width=4, command=lambda p=path: self.remove(p)).pack(side="left", padx=(8, 0))
+        start_all = ttk.Button(header, text="一键启动", command=lambda p=path: self.start_project(p))
+        start_all.place(relx=0.5, rely=0.5, anchor="center")
+        left.place(relwidth=0.5, width=-(start_all.winfo_reqwidth() // 2 + 8), relheight=1)
         frame = ttk.LabelFrame(self.body, labelwidget=header)
         frame.bind("<Configure>", lambda event, box=header: self._fit_project_header(box, event.width), add="+")
         if before is not None:

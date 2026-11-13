@@ -30,6 +30,10 @@ Windows 上的本地服务启动器。把项目目录关联进来后，按该项
 
 启动器只登记项目、配置名称和配置文件引用。每次启动或重启前都会重新读取对应配置文件中的命令、工作目录、环境变量和参数；修改 VS Code 配置后不需要重新登记启动器。
 
+### 脚本
+
+把任意目录中的 `.ps1`、`.bat` 或 `.cmd` 文件拖进窗口，即可添加到主界面的「脚本」列表。悬停在文件名上可查看完整路径。点击「启动」会在独立控制台中执行脚本，工作目录为脚本所在目录。右击脚本行可选择「所在目录」或「移除」，右击项目名称可选择「项目文件夹」。添加或移除脚本后点「保存」，下次打开时会加载保存的脚本列表。
+
 ### 启动、重启、关闭
 
 每一项都有「启动」「重启」「关闭」。
@@ -43,7 +47,8 @@ Windows 上的本地服务启动器。把项目目录关联进来后，按该项
 窗口右上角是一枚齿轮图标，点它打开设置。
 
 - **关闭启动器时**：每次询问、关闭正在运行的服务，或只关窗口、服务继续留着。
-- **启动时的 cmd 窗口**：弹出，或最小化到任务栏。最小化后窗口还在，可以从任务栏再打开。
+- **项目控制台**：弹出，或最小化到任务栏。最小化后窗口还在，可以从任务栏再打开。
+- **脚本控制台**：默认显示，脚本结束后窗口会保留，也可以设为隐藏。需要输入内容的脚本应使用「显示」。
 
 没有服务在跑时，关闭启动器不会询问。
 
@@ -111,7 +116,8 @@ While an item is running, the number after **已启动** is the cmd process id.
 The gear at the top right opens settings.
 
 - **When closing the launcher**: ask every time, stop running services, or close the window and leave the services running.
-- **Cmd window on start**: show it, or minimize it to the taskbar. A minimized window is still there and can be opened from the taskbar.
+- **Project console**: show it, or minimize it to the taskbar. A minimized window can be reopened from the taskbar.
+- **Script console**: shown by default and kept open after the script exits. Hide it for scripts that run without input.
 
 If nothing is running, closing the launcher does not ask.
 
